@@ -1,0 +1,138 @@
+-- grub-eeprom.lua
+local init
+do
+  local component_invoke = component.invoke
+  local function boot_invoke(address, method, ...)
+    local result = table.pack(pcall(component_invoke, address, method, ...))
+    if not result[1] then
+      return nil, result[2]
+    else
+      return table.unpack(result, 2, result.n)
+    end
+  end
+
+  -- Backwards compatibility
+  local eeprom = component.list("eeprom")()
+  computer.getBootAddress = function()
+    return boot_invoke(eeprom, "getData")
+  end
+  computer.setBootAddress = function(address)
+    return boot_invoke(eeprom, "setData", address)
+  end
+
+  -- GPU binding
+  do
+    local screen = component.list("screen")()
+    local gpu = component.list("gpu")()
+    if gpu and screen then
+      boot_invoke(gpu, "bind", screen)
+    end
+  end
+
+  -- Функция чтения файла
+  local function readFile(address, path)
+    local handle, reason = boot_invoke(address, "open", path)
+    if not handle then return nil, reason end
+    local buffer = ""
+    repeat
+      local data, reason = boot_invoke(address, "read", handle, math.huge)
+      if not data and reason then
+        boot_invoke(address, "close", handle)
+        return nil, reason
+      end
+      buffer = buffer .. (data or "")
+    until not data
+    boot_invoke(address, "close", handle)
+    return buffer
+  end
+
+  -- Функция загрузки скрипта по пути
+  local function tryLoadFromPath(address, filepath)
+    local code, reason = readFile(address, filepath)
+    if not code then return nil, reason end
+    local chunk, err = load(code, "=" .. filepath)
+    if not chunk then return nil, err end
+    return chunk
+  end
+
+  -- Ищем конфиг GRUB: /boot/grub.cfg или /grub.cfg
+  local function findGrubConfig()
+    if computer.getBootAddress() then
+      -- Сначала пробуем прочитать конфиг с загрузочного диска
+      local bootAddr = computer.getBootAddress()
+      for _, cfgPath in ipairs{"/boot/grub.cfg", "/grub.cfg"} do
+        local config = readFile(bootAddr, cfgPath)
+        if config then
+          return bootAddr, config
+        end
+      end
+    end
+
+    -- Если не нашли — ищем на всех ФС
+    for address in component.list("filesystem") do
+      for _, cfgPath in ipairs{"/boot/grub.cfg", "/grub.cfg"} do
+        local config = readFile(address, cfgPath)
+        if config then
+          return address, config
+        end
+      end
+    end
+    return nil
+  end
+
+  -- Парсим конфиг: ищем строку `linux /path/to/init.lua`
+  local function parseGrubConfig(config)
+    for line in config:gmatch("[^\r\n]+") do
+      line = line:match("^%s*(.-)%s*$") -- trim
+      if line:sub(1, 5) == "linux" then
+        local path = line:sub(6):match("^%s*(.-)%s*$")
+        if path and path ~= "" then
+          return path
+        end
+      end
+    end
+    return "/init.lua" -- fallback
+  end
+
+  -- Основная логика загрузки
+  local reason
+  local bootAddress = computer.getBootAddress()
+  local customPath
+
+  -- Пытаемся найти и прочитать grub.cfg
+  local cfgAddress, cfgContent = findGrubConfig()
+  if cfgContent then
+    customPath = parseGrubConfig(cfgContent)
+    -- Если конфиг найден на другом диске — используем его как загрузочный
+    if cfgAddress then
+      bootAddress = cfgAddress
+      computer.setBootAddress(bootAddress)
+    end
+  else
+    customPath = "/init.lua"
+  end
+
+  -- Загружаем указанный скрипт
+  if bootAddress then
+    init, reason = tryLoadFromPath(bootAddress, customPath)
+  end
+
+  -- Если не удалось — ищем /init.lua на всех дисках (как раньше)
+  if not init then
+    computer.setBootAddress()
+    for address in component.list("filesystem") do
+      init, reason = tryLoadFromPath(address, "/init.lua")
+      if init then
+        computer.setBootAddress(address)
+        break
+      end
+    end
+  end
+
+  if not init then
+    error("no bootable medium found" .. (reason and (": " .. tostring(reason)) or ""), 0)
+  end
+
+  computer.beep(1000, 0.2)
+end
+return init()
